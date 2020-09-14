@@ -9,9 +9,11 @@ import datetime
 ffmpeg_bin = "/usr/bin/ffmpeg"
 ffprobe_bin = "/usr/bin/ffprobe"
 exiftool_bin = "/usr/bin/exiftool"
+image_viewer = "/usr/bin/eog"
 ffmpeg_quiet = ["-hide_banner", "-loglevel", "panic"]
-ffmpeg_default_opts = ffmpeg_quiet+["-c:a", "aac", "-crf", "19"]
-ffmpeg_quick_opts = ffmpeg_quiet+["-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-crf", "30"]
+ffmpeg_default_opts = ffmpeg_quiet + ["-c:a", "aac", "-crf", "19"]
+ffmpeg_quick_opts = ffmpeg_quiet + ["-c:a", "aac", "-b:a", "96k",
+                                    "-movflags", "+faststart", "-crf", "30"]
 timeshift = "02:00"
 
 __author__ = "Henning Hollermann"
@@ -31,6 +33,9 @@ parser.add_argument("--dry", default=False, action='store_true',
 parser.add_argument("--no_suggest", default=False, action='store_true',
                         help="Do not suggest filenames based on exif-data of related "
                              "image files.")
+parser.add_argument("--show_image", default=False, action='store_true',
+                        help="Use the configured image viewer to display the image "
+                             "which matches best the exif date of the video.")
 parser.add_argument("-f","--force", default=False, action='store_true', 
                         help="Force. Overwrite existing files.")
 parser.add_argument("-v", "--version", action='store_true', help="Print version")
@@ -102,13 +107,15 @@ def copy_timstamps(sourcefile,targetfile):
     This function uses exiftool and the datetimeoriginal of the source file to set the 
     modification time and the exif datetimeoriginal of the target file
     """
-    exclude_tags=["--ImageSize", "--ImageWidth","--ImageHeight"]
+    exclude_tags=["--ImageSize", "--ImageWidth", "--ImageHeight"]
     subprocess.check_call([exiftool_bin, '-ee', '-overwrite_original', '-tagsFromFile', 
                 sourcefile, *exclude_tags, targetfile])
-    subprocess.check_call([exiftool_bin, '-overwrite_original', '-DateTimeOriginal<${datetimeoriginal}+' + timeshift,
-                targetfile])
+    subprocess.check_call([exiftool_bin, '-overwrite_original',
+                           "-DateTimeOriginal<${datetimeoriginal}+{0}".format(timeshift),
+                           targetfile])
     timestamp = subprocess.check_output("{0} -DateTimeOriginal -S -s "
-                                        "-d \'%Y-%m-%d %H:%M:%S%z\' {1}".format(exiftool_bin, sourcefile),
+                                        "-d \'%Y-%m-%d %H:%M:%S%z\' "
+                                        "{1}".format(exiftool_bin, sourcefile),
                   shell=True)
     subprocess.check_call(['touch', '-d', timestamp, targetfile])
 
@@ -116,7 +123,8 @@ def copy_timstamps(sourcefile,targetfile):
 def get_small_edge(file):
     """Use ffprobe to determine the length video's short edge"""
     vidsize = subprocess.check_output("{0} -v error -select_streams v:0 "
-                                      "-show_entries stream=width,height -of csv=s=x:p=0 {1}".format(ffprobe_bin, file),
+                                      "-show_entries stream=width,height "
+                                      "-of csv=s=x:p=0 {1}".format(ffprobe_bin, file),
                 shell=True)
     size = vidsize.decode("utf-8").split("\n")[0].split("x")
     l = [int(i) for i in size]
@@ -125,7 +133,8 @@ def get_small_edge(file):
 def get_duration(file):
     """Use ffprobe to determine the duration of a video file"""
     duration = subprocess.check_output("{0} -v error -show_entries format=duration "
-                                       "-of default=noprint_wrappers=1:nokey=1 {1}".format(ffprobe_bin, file),
+                                       "-of default=noprint_wrappers=1:nokey=1 "
+                                       "{1}".format(ffprobe_bin, file),
                                        shell=True)
     return duration
 
@@ -153,7 +162,7 @@ def get_closest_filepath(file,tolerance=300):
     """
     vid_timestamp_str = subprocess.check_output("{0} -datetimeoriginal -FileModifyDate "
                                                 "-S -s -d %s -T {1}".format(exiftool_bin, file),
-                    shell=True).decode("utf-8").split("\n")[0].split("\t")
+                                                shell=True).decode("utf-8").split("\n")[0].split("\t")
     try:
         vid_timestamp = int(vid_timestamp_str[0])
     except ValueError:
@@ -162,14 +171,17 @@ def get_closest_filepath(file,tolerance=300):
             print("Info: using file modification time as indicator for " 
             "file {} due to a nonexistent DateTimeOriginal exif field.".format(file))
         except ValueError:
-            print("Error: neither DateTimeOriginal nor FileModifyDate was found for file {}. Exiting".format(file))
+            print("Error: neither DateTimeOriginal nor FileModifyDate was found for file {}. "
+                  "Exiting".format(file))
             sys.exit()
     try:
         exif_data_table = subprocess.check_output("{0} -filepath -datetimeoriginal -FileModifyDate " 
-                        "-S -s -r -d %s -T -if \'$mimetype =~ m\"^image/[^x]\"\' {1}".format(exiftool_bin, args.dir),
-                        shell=True).decode("utf-8").split("\n")
+                        "-S -s -r -d %s -T -if \'$mimetype =~ m\"^image/[^x]\"\' "
+                                                  "{1}".format(exiftool_bin, args.dir),
+                                                  shell=True).decode("utf-8").split("\n")
     except subprocess.CalledProcessError:
-        print("Warning: no images found in directory {0}. Disabling filename suggestion.".format(args.dir))
+        print("Warning: no images found in directory {0}. "
+              "Disabling filename suggestion.".format(args.dir))
         args.no_suggest = True
         return None
     image_table = [item.split("\t") for item in exif_data_table if item]
@@ -182,14 +194,29 @@ def get_closest_filepath(file,tolerance=300):
             print("Warning: {} skipped.".format(file))
             continue
         files.append(item[0])
-    time_diff = [abs(time-vid_timestamp) for time in times]
+
+    vid_duration = float(get_duration(file))
+    time_diff = []
+    for time in times:
+        if time-vid_timestamp >= 0:
+            # if the image is taken after the video, the closest time is the exif date difference
+            time_diff.append(abs(time - vid_timestamp))
+        else:
+            # if the image is taken prior to the video, the video duration is substracted
+            # because its timestamp is written only at the end of capture
+            time_diff.append(abs(time - vid_timestamp - vid_duration))
     min_time_diff = min(time_diff)
     image_closest_time = time_diff.index(min_time_diff)
     if min_time_diff > tolerance:
         print("Warning: No related file found for file {}. The one with the closest timestamp "
-        "(difference {}) was {}".format(file,get_timestr(min_time_diff),files[image_closest_time]))
+        "(difference {}) was {}".format(file,get_timestr(min_time_diff),
+                                        files[image_closest_time]))
         return None
     else:
+        print("Info: file with {0} sec time difference found: "
+              "{1}".format(min_time_diff, files[image_closest_time]))
+        if args.show_image:
+            subprocess.call([image_viewer, files[image_closest_time]])
         return files[image_closest_time]
 
 
@@ -244,10 +271,10 @@ def fade(file):
         duration = get_duration(file)
         st_in=0
         st_out=round(float(duration) - d_out, 2)
-    fade_filter_a = "afade=in:st={0}:d={1},afade=out:st={2}:d={3}".format(st_in,
-                                                                          d_in, st_out, d_out)
-    fade_filter_v = "fade=in:st={0}:d={1},fade=out:st={2}:d={3}".format(st_in,
-                                                                        d_in, st_out, d_out)
+    fade_filter_a = "afade=in:st={0}:d={1}," \
+                    "afade=out:st={2}:d={3}".format(st_in, d_in, st_out, d_out)
+    fade_filter_v = "fade=in:st={0}:d={1}," \
+                    "fade=out:st={2}:d={3}".format(st_in, d_in, st_out, d_out)
     return [fade_filter_v,fade_filter_a]
 
 
@@ -289,7 +316,8 @@ def main():
             # res_list 100 means: "do not scale at all" (returns empty filter)
             res_list = ["100"]
         for r in res_list:
-            ffmpeg_filter_v[r] = ['-filter:v', ','.join([transpose_filter, scale_filter[r]]).strip(",")]
+            ffmpeg_filter_v[r] = ['-filter:v', ','.join([transpose_filter,
+                                                         scale_filter[r]]).strip(",")]
 
     for file in args.inputfile:
         # use exiftool to get the file with the closest timestamp
@@ -308,7 +336,8 @@ def main():
                 outfile = prepend + os.path.basename(outfile)
             elif suggested and not args.no_suggest:
                 print("Tip: You could rename the file manually to {0}{1} "
-                      "or set the --rename flag.".format(prepend, os.path.basename(outfile)))
+                      "or set the --rename flag.".format(prepend,
+                                                         os.path.basename(outfile)))
             convert(file,outfile,ffmpeg_args)
         else:
             # process cut options
@@ -328,9 +357,11 @@ def main():
                         outfile = prepend + os.path.basename(outfile)
                     elif suggested and not args.no_suggest:
                         print("Tip: You could rename the file manually to {0}{1} "
-                              "or set the --rename flag.".format(prepend, os.path.basename(outfile)))
+                              "or set the --rename flag.".format(prepend,
+                                                                 os.path.basename(outfile)))
                     if args.fade:
-                        ffmpeg_filter_v[r][1] = ",".join([ffmpeg_filter_v[r][1],fade_filter_v]).strip(",")
+                        ffmpeg_filter_v[r][1] = ",".join([ffmpeg_filter_v[r][1],
+                                                          fade_filter_v]).strip(",")
                     
                     # run ffmpeg (only prints command in DRY mode)
                     convert(file, outfile, ffmpeg_args + ffmpeg_filter_v[r] + ffmpeg_filter_a)
